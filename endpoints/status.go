@@ -73,7 +73,7 @@ func buildDependencyChecks(cfg *config.Configuration) []dependencyCheck {
 	if cfg == nil {
 		return nil
 	}
-	checks := make([]dependencyCheck, 0, 8)
+	checks := make([]dependencyCheck, 0, 9)
 	addEndpointCheck := func(name, kind, scheme, host string) {
 		addr := endpointDialAddr(scheme, host)
 		if addr == "" {
@@ -114,6 +114,14 @@ func buildDependencyChecks(cfg *config.Configuration) []dependencyCheck {
 		checks = append(checks, dependencyCheck{
 			name:     "dashboard_db",
 			kind:     "database",
+			target:   net.JoinHostPort(host, port),
+			dialAddr: net.JoinHostPort(host, port),
+		})
+	}
+	if host, port := clickHouseHostPort(os.Getenv("CLICKHOUSE_DSN")); host != "" {
+		checks = append(checks, dependencyCheck{
+			name:     "clickhouse_analytics",
+			kind:     "analytics",
 			target:   net.JoinHostPort(host, port),
 			dialAddr: net.JoinHostPort(host, port),
 		})
@@ -269,4 +277,34 @@ func dashboardDBHostPort(dsn string) (string, string) {
 		port = "5432"
 	}
 	return host, port
+}
+
+func clickHouseHostPort(dsn string) (string, string) {
+	dsn = strings.TrimSpace(dsn)
+	if dsn == "" {
+		return "", ""
+	}
+	if strings.Contains(dsn, "://") {
+		if parsed, err := url.Parse(dsn); err == nil {
+			host := parsed.Hostname()
+			if host == "" {
+				return "", ""
+			}
+			port := parsed.Port()
+			if port == "" {
+				port = "9000"
+			}
+			return host, port
+		}
+	}
+	if host, port, err := net.SplitHostPort(dsn); err == nil {
+		if strings.TrimSpace(host) == "" {
+			return "", ""
+		}
+		if strings.TrimSpace(port) == "" {
+			port = "9000"
+		}
+		return host, port
+	}
+	return strings.TrimSpace(dsn), "9000"
 }
