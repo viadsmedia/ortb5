@@ -419,7 +419,7 @@ func New(cfg *config.Configuration, rateConverter *currency.RateConverter) (r *R
 	// Wire demand-routing dependencies into the VideoExchange handler, wire live
 	// video stats into the supply/demand partner list endpoints, then register
 	// all dashboard routes (auth-protected) via the central registry.
-	dashReg.WireVideoExchange(videoPipeline.RegisterAdServerConfig, videoPipeline.UnregisterAdServerConfig)
+	dashReg.WireVideoExchange(videoPipeline.RegisterAdServerConfig, videoPipeline.UnregisterAdServerConfig, videoPipeline.LookupAdServerConfig)
 	dashReg.WireVideoStats(videoPipeline.Snapshot)
 	dashReg.WireRevenueConsoleMasters()
 	dashReg.Register(r.Router, auth)

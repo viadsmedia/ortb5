@@ -603,8 +603,9 @@ type VideoStats struct {
 	AdRequests       int64   `json:"ad_requests"`
 	Opportunities    int64   `json:"opportunities"` // VAST served (adapter returned a creative)
 	Impressions      int64   `json:"impressions"`   // player-confirmed: /video/tracking?event=impression
+	Starts           int64   `json:"starts"`        // player-confirmed: /video/tracking?event=start
 	Completes        int64   `json:"completes"`     // player-confirmed: /video/tracking?event=complete
-	VCR              float64 `json:"vcr_pct"`       // video completion rate: completes ÷ impressions × 100
+	VCR              float64 `json:"vcr_pct"`       // video completion rate: completes ÷ starts × 100
 	Revenue          float64 `json:"revenue"`       // advertiser revenue in USD (demand win CPM ÷ 1000 per impression)
 	PublisherRevenue float64 `json:"publisher_revenue,omitempty"`
 }
@@ -632,6 +633,7 @@ type VideoOverviewSummary struct {
 	AdRequests       int64   `json:"ad_requests"`
 	Opportunities    int64   `json:"opportunities"`
 	Impressions      int64   `json:"impressions"`
+	Starts           int64   `json:"starts"`
 	Completes        int64   `json:"completes"`
 	Revenue          float64 `json:"revenue"`
 	PublisherRevenue float64 `json:"publisher_revenue"`
@@ -729,6 +731,16 @@ func newVideoStatsStore(filePath string) *videoStatsStore {
 	}
 	s.load()
 	return s
+}
+
+func videoCompletionRate(stats VideoStats) float64 {
+	if stats.Starts > 0 {
+		return float64(stats.Completes) / float64(stats.Starts) * 100
+	}
+	if stats.Impressions > 0 {
+		return float64(stats.Completes) / float64(stats.Impressions) * 100
+	}
+	return 0
 }
 
 // load reads previously-saved stats from disk (best effort; skips if file absent).
@@ -1022,6 +1034,39 @@ func (s *videoStatsStore) incDimComplete(auctionID string) {
 	s.mu.Unlock()
 }
 
+// incDimStart credits all 7 dimension buckets for the given auctionID's start.
+func (s *videoStatsStore) incDimStart(auctionID string) {
+	if auctionID == "" {
+		return
+	}
+	s.mu.Lock()
+	dk := s.auctionDims[auctionID]
+	if dk != nil {
+		if v := s.byBidder[dk.Bidder]; v != nil {
+			v.Starts++
+		}
+		if v := s.byApp[dk.App]; v != nil {
+			v.Starts++
+		}
+		if v := s.byPlacement[dk.Placement]; v != nil {
+			v.Starts++
+		}
+		if v := s.byCountry[dk.Country]; v != nil {
+			v.Starts++
+		}
+		if v := s.byDevice[dk.Device]; v != nil {
+			v.Starts++
+		}
+		if v := s.byFormat[dk.Format]; v != nil {
+			v.Starts++
+		}
+		if v := s.byDemandChannel[dk.DemandCh]; v != nil {
+			v.Starts++
+		}
+	}
+	s.mu.Unlock()
+}
+
 // incRequestBatch batches both publisher and advertiser request increments
 // under a single lock acquisition — 1 lock instead of 2 per request.
 func (s *videoStatsStore) incRequestBatch(pubID, advID string) {
@@ -1083,6 +1128,24 @@ func (s *videoStatsStore) incAdvertiserFill(advID string) {
 	}
 	s.mu.Lock()
 	s.getOrCreateAdv(advID).Opportunities++
+	s.mu.Unlock()
+}
+
+func (s *videoStatsStore) incStart(pubID string) {
+	if pubID == "" {
+		pubID = "unknown"
+	}
+	s.mu.Lock()
+	s.getOrCreate(pubID).Starts++
+	s.mu.Unlock()
+}
+
+func (s *videoStatsStore) incAdvertiserStart(advID string) {
+	if advID == "" {
+		return
+	}
+	s.mu.Lock()
+	s.getOrCreateAdv(advID).Starts++
 	s.mu.Unlock()
 }
 
@@ -1154,9 +1217,7 @@ func (s *videoStatsStore) snapshot() VideoStatsPayload {
 		out := make(map[string]*VideoStats, len(src))
 		for k, v := range src {
 			cp := *v
-			if cp.Impressions > 0 {
-				cp.VCR = float64(cp.Completes) / float64(cp.Impressions) * 100
-			}
+			cp.VCR = videoCompletionRate(cp)
 			out[k] = &cp
 		}
 		return out
@@ -1174,26 +1235,21 @@ func (s *videoStatsStore) snapshot() VideoStatsPayload {
 	}
 	for k, v := range s.byPub {
 		cp := *v
-		if cp.Impressions > 0 {
-			cp.VCR = float64(cp.Completes) / float64(cp.Impressions) * 100
-		}
+		cp.VCR = videoCompletionRate(cp)
 		out.ByPublisher[k] = &cp
 		out.Total.AdRequests += cp.AdRequests
 		out.Total.Opportunities += cp.Opportunities
 		out.Total.Impressions += cp.Impressions
+		out.Total.Starts += cp.Starts
 		out.Total.Completes += cp.Completes
 		out.Total.Revenue += cp.Revenue
 	}
 	for k, v := range s.byAdvertiser {
 		cp := *v
-		if cp.Impressions > 0 {
-			cp.VCR = float64(cp.Completes) / float64(cp.Impressions) * 100
-		}
+		cp.VCR = videoCompletionRate(cp)
 		out.ByAdvertiser[k] = &cp
 	}
-	if out.Total.Impressions > 0 {
-		out.Total.VCR = float64(out.Total.Completes) / float64(out.Total.Impressions) * 100
-	}
+	out.Total.VCR = videoCompletionRate(out.Total)
 	out.StartedAt = s.startedAt.Unix()
 	return out
 }
@@ -2293,6 +2349,53 @@ func (h *VideoPipelineHandler) resolveAdServerConfig(placementID string) (*AdSer
 // install or update placement-level ad server configuration at runtime.
 func (h *VideoPipelineHandler) RegisterAdServerConfig(cfg *AdServerConfig) {
 	h.configStore.set(cfg)
+}
+
+// LookupAdServerConfig returns the runtime config for a placement when one is
+// currently registered. It does not synthesize the permissive default used by
+// serving, because dashboard recovery only wants explicitly managed placements.
+func (h *VideoPipelineHandler) LookupAdServerConfig(placementID string) *AdServerConfig {
+	if cfg := h.configStore.get(placementID); cfg != nil {
+		cp := *cfg
+		if len(cfg.Protocols) > 0 {
+			cp.Protocols = append([]int(nil), cfg.Protocols...)
+		}
+		if len(cfg.APIs) > 0 {
+			cp.APIs = append([]int(nil), cfg.APIs...)
+		}
+		if len(cfg.AllowedBidders) > 0 {
+			cp.AllowedBidders = append([]string(nil), cfg.AllowedBidders...)
+		}
+		if len(cfg.BAdv) > 0 {
+			cp.BAdv = append([]string(nil), cfg.BAdv...)
+		}
+		if len(cfg.BCat) > 0 {
+			cp.BCat = append([]string(nil), cfg.BCat...)
+		}
+		if len(cfg.MimeTypes) > 0 {
+			cp.MimeTypes = append([]string(nil), cfg.MimeTypes...)
+		}
+		if len(cfg.CompanionType) > 0 {
+			cp.CompanionType = append([]int(nil), cfg.CompanionType...)
+		}
+		if len(cfg.ExtraDemand) > 0 {
+			cp.ExtraDemand = append([]ExtraDemandCfg(nil), cfg.ExtraDemand...)
+		}
+		if len(cfg.SeatWeights) > 0 {
+			cp.SeatWeights = make(map[string]float64, len(cfg.SeatWeights))
+			for key, value := range cfg.SeatWeights {
+				cp.SeatWeights[key] = value
+			}
+		}
+		if len(cfg.TargetingExt) > 0 {
+			cp.TargetingExt = make(map[string]interface{}, len(cfg.TargetingExt))
+			for key, value := range cfg.TargetingExt {
+				cp.TargetingExt[key] = value
+			}
+		}
+		return &cp
+	}
+	return nil
 }
 
 // UnregisterAdServerConfig removes a placement from the pipeline config store
@@ -4346,6 +4449,14 @@ func (h *VideoPipelineHandler) TrackingEndpoint() httprouter.Handle {
 			h.videoStats.mu.Unlock()
 		}
 		h.recordTrackingMetric(ev, cfg, dk)
+
+		if ev.Event == EventStart {
+			if cfg != nil {
+				h.videoStats.incStart(cfg.PublisherID)
+				h.videoStats.incAdvertiserStart(cfg.AdvertiserID)
+			}
+			h.videoStats.incDimStart(ev.AuctionID)
+		}
 
 		// Count player-confirmed completes (100% viewed).
 		if ev.Event == EventComplete {

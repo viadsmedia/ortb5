@@ -807,6 +807,7 @@ type VideoExchangeHandler struct {
 	campStore     *campaignStore        // resolved lazily via SetCampaignStore
 	registerCfg   func(*AdServerConfig) // pipline config hook; set via SetPipelineRegister
 	unregisterCfg func(string)          // pipeline config removal hook; set via SetPipelineUnregister
+	lookupCfg     func(string) *AdServerConfig
 }
 
 // NewVideoExchangeHandler creates a VideoExchangeHandler backed by a persistent store.
@@ -823,6 +824,10 @@ func (h *VideoExchangeHandler) SetPipelineRegister(fn func(*AdServerConfig)) { h
 
 // SetPipelineUnregister injects the callback used to remove AdServerConfig from the pipeline.
 func (h *VideoExchangeHandler) SetPipelineUnregister(fn func(string)) { h.unregisterCfg = fn }
+
+// SetPipelineLookup injects the callback used to recover runtime placement config
+// when the dashboard CRUD store is stale or missing an ad unit row.
+func (h *VideoExchangeHandler) SetPipelineLookup(fn func(string) *AdServerConfig) { h.lookupCfg = fn }
 
 // SyncAllToPipeline pushes every ad unit that was loaded from disk into the pipeline
 // config store.  Must be called once from router setup after both SetCampaignStore and
@@ -952,6 +957,111 @@ func (h *VideoExchangeHandler) syncPipelineCfg(e *VideoExchangeEntry) {
 	h.registerCfg(cfg)
 }
 
+func normalizeVideoPlacement(value string) VideoPlacement {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case string(PlacementOutStream):
+		return PlacementOutStream
+	case string(PlacementInterstitial):
+		return PlacementInterstitial
+	case string(PlacementRewarded):
+		return PlacementRewarded
+	default:
+		return PlacementInStream
+	}
+}
+
+func inferVideoEnvironment(cfg *AdServerConfig) VideoEnv {
+	placement := normalizeVideoPlacement(cfg.VideoPlacementType)
+	if placement == PlacementRewarded || placement == PlacementInterstitial {
+		return VideoEnvInApp
+	}
+	if strings.TrimSpace(cfg.ContentURL) != "" {
+		return VideoEnvCTV
+	}
+	return VideoEnvCTV
+}
+
+func appendUniqueDemandLink(links []string, campaignID string) []string {
+	campaignID = strings.TrimSpace(campaignID)
+	if campaignID == "" {
+		return links
+	}
+	for _, existing := range links {
+		if existing == campaignID {
+			return links
+		}
+	}
+	return append(links, campaignID)
+}
+
+func copyTargetingExt(src map[string]interface{}) map[string]interface{} {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make(map[string]interface{}, len(src))
+	for key, value := range src {
+		out[key] = value
+	}
+	return out
+}
+
+func (h *VideoExchangeHandler) entryFromRuntimeConfig(cfg *AdServerConfig) *VideoExchangeEntry {
+	if cfg == nil || strings.TrimSpace(cfg.PlacementID) == "" {
+		return nil
+	}
+	environment := inferVideoEnvironment(cfg)
+	entry := &VideoExchangeEntry{
+		ID:              cfg.PlacementID,
+		PublisherID:     cfg.PublisherID,
+		Name:            cfg.PlacementID,
+		Environment:     environment,
+		Placement:       normalizeVideoPlacement(cfg.VideoPlacementType),
+		MinDuration:     cfg.MinDuration,
+		MaxDuration:     cfg.MaxDuration,
+		PodDurationSec:  cfg.PodDuration,
+		MaxPods:         cfg.MaxSeq,
+		PodSequence:     cfg.PodSequence,
+		CompanionType:   append([]int(nil), cfg.CompanionType...),
+		CatTax:          cfg.CatTax,
+		SellerDomain:    cfg.SellerDomain,
+		DomainOrApp:     cfg.DomainOrApp,
+		ContentURL:      cfg.ContentURL,
+		TargetingExt:    copyTargetingExt(cfg.TargetingExt),
+		IntegrationType: "open_rtb",
+		FloorCPM:        cfg.FloorCPM,
+		Bidders:         append([]string(nil), cfg.AllowedBidders...),
+		Active:          cfg.Active,
+		TimeoutMS:       cfg.TimeoutMS,
+		CampaignID:      cfg.CampaignID,
+	}
+	if environment == VideoEnvInApp {
+		entry.BundleID = cfg.DomainOrApp
+	}
+	if cfg.DemandVASTURL != "" && cfg.DemandOrtbURL == "" {
+		entry.IntegrationType = "tag_based"
+	}
+	entry.DemandLinks = appendUniqueDemandLink(entry.DemandLinks, cfg.CampaignID)
+	for _, extra := range cfg.ExtraDemand {
+		entry.DemandLinks = appendUniqueDemandLink(entry.DemandLinks, extra.CampaignID)
+	}
+	return entry
+}
+
+func (h *VideoExchangeHandler) recoverEntry(id string) (*VideoExchangeEntry, bool) {
+	entry, ok := h.store.get(id)
+	if ok {
+		return entry, true
+	}
+	if h.lookupCfg == nil {
+		return nil, false
+	}
+	entry = h.entryFromRuntimeConfig(h.lookupCfg(id))
+	if entry == nil {
+		return nil, false
+	}
+	return h.store.put(entry), true
+}
+
 // List handles GET /dashboard/video — returns all entries.
 func (h *VideoExchangeHandler) List() httprouter.Handle {
 	return func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
@@ -984,7 +1094,7 @@ func (h *VideoExchangeHandler) Create() httprouter.Handle {
 func (h *VideoExchangeHandler) Get() httprouter.Handle {
 	return func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 		id := ps.ByName("id")
-		entry, ok := h.store.get(id)
+		entry, ok := h.recoverEntry(id)
 		if !ok {
 			writeError(w, http.StatusNotFound, "entry not found: "+id)
 			return
@@ -1005,6 +1115,10 @@ func (h *VideoExchangeHandler) Update() httprouter.Handle {
 			writeError(w, http.StatusBadRequest, msg)
 			return
 		}
+		if _, ok := h.recoverEntry(id); !ok {
+			writeError(w, http.StatusNotFound, "entry not found: "+id)
+			return
+		}
 		updated, ok := h.store.update(id, &patch)
 		if !ok {
 			writeError(w, http.StatusNotFound, "entry not found: "+id)
@@ -1019,9 +1133,12 @@ func (h *VideoExchangeHandler) Update() httprouter.Handle {
 func (h *VideoExchangeHandler) Delete() httprouter.Handle {
 	return func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 		id := ps.ByName("id")
-		if !h.store.delete(id) {
-			writeError(w, http.StatusNotFound, "entry not found: "+id)
-			return
+		deleted := h.store.delete(id)
+		if !deleted {
+			if h.lookupCfg == nil || h.lookupCfg(id) == nil {
+				writeError(w, http.StatusNotFound, "entry not found: "+id)
+				return
+			}
 		}
 		if h.unregisterCfg != nil {
 			h.unregisterCfg(id)
@@ -1218,6 +1335,26 @@ func (s *entityStore[E]) create(e E) E {
 	now := time.Now().UTC()
 	e.setTimestamps(now, now)
 	s.mu.Lock()
+	s.entries[e.getID()] = e
+	s.mu.Unlock()
+	safeGo(s.save)
+	return e
+}
+
+func (s *entityStore[E]) put(e E) E {
+	if e.getID() == "" {
+		e.setID(generateID())
+	}
+	now := time.Now().UTC()
+	s.mu.Lock()
+	createdAt := e.getCreatedAt()
+	if existing, ok := s.entries[e.getID()]; ok {
+		createdAt = existing.getCreatedAt()
+	}
+	if createdAt.IsZero() {
+		createdAt = now
+	}
+	e.setTimestamps(createdAt, now)
 	s.entries[e.getID()] = e
 	s.mu.Unlock()
 	safeGo(s.save)
@@ -3301,10 +3438,11 @@ func (reg *DashboardRegistry) WireRevenueConsoleMasters() {
 // and the campaign store into the VideoExchange handler, then syncs all
 // placements loaded from disk back into the pipeline.
 // Call after videoPipeline is constructed and before Register.
-func (reg *DashboardRegistry) WireVideoExchange(registerCfg func(*AdServerConfig), unregisterCfg func(string)) {
+func (reg *DashboardRegistry) WireVideoExchange(registerCfg func(*AdServerConfig), unregisterCfg func(string), lookupCfg func(string) *AdServerConfig) {
 	reg.VideoExchange.SetCampaignStore(reg.Campaign.Store())
 	reg.VideoExchange.SetPipelineRegister(registerCfg)
 	reg.VideoExchange.SetPipelineUnregister(unregisterCfg)
+	reg.VideoExchange.SetPipelineLookup(lookupCfg)
 	reg.VideoExchange.SyncAllToPipeline()
 	// Re-sync all placements whenever a campaign URL changes.
 	reg.Campaign.SetOnChange(reg.VideoExchange.SyncAllToPipeline)

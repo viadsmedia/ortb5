@@ -339,6 +339,7 @@ func (s *clickHouseVideoMetricsStore) queryGrouped(ctx context.Context, column s
 			countIf(event_type = 'request') AS ad_requests,
 			countIf(event_type = 'opportunity') AS opportunities,
 			countIf(event_type = 'impression') AS impressions,
+			countIf(event_type = 'start') AS starts,
 			countIf(event_type = 'complete') AS completes,
 			sumIf(revenue_usd, event_type = 'impression') AS revenue,
 			sumIf(publisher_revenue_usd, event_type = 'impression') AS publisher_revenue
@@ -354,12 +355,10 @@ func (s *clickHouseVideoMetricsStore) queryGrouped(ctx context.Context, column s
 	for rows.Next() {
 		var key string
 		stats := &VideoStats{}
-		if err := rows.Scan(&key, &stats.AdRequests, &stats.Opportunities, &stats.Impressions, &stats.Completes, &stats.Revenue, &stats.PublisherRevenue); err != nil {
+		if err := rows.Scan(&key, &stats.AdRequests, &stats.Opportunities, &stats.Impressions, &stats.Starts, &stats.Completes, &stats.Revenue, &stats.PublisherRevenue); err != nil {
 			return nil, err
 		}
-		if stats.Impressions > 0 {
-			stats.VCR = float64(stats.Completes) / float64(stats.Impressions) * 100
-		}
+		stats.VCR = videoCompletionRate(*stats)
 		out[key] = stats
 	}
 	return out, rows.Err()
@@ -371,18 +370,17 @@ func (s *clickHouseVideoMetricsStore) queryTotal(ctx context.Context) (VideoStat
 			countIf(event_type = 'request') AS ad_requests,
 			countIf(event_type = 'opportunity') AS opportunities,
 			countIf(event_type = 'impression') AS impressions,
+			countIf(event_type = 'start') AS starts,
 			countIf(event_type = 'complete') AS completes,
 			sumIf(revenue_usd, event_type = 'impression') AS revenue,
 			sumIf(publisher_revenue_usd, event_type = 'impression') AS publisher_revenue
 		FROM %s
 	`, s.table)
 	stats := VideoStats{}
-	if err := s.db.QueryRowContext(ctx, query).Scan(&stats.AdRequests, &stats.Opportunities, &stats.Impressions, &stats.Completes, &stats.Revenue, &stats.PublisherRevenue); err != nil {
+	if err := s.db.QueryRowContext(ctx, query).Scan(&stats.AdRequests, &stats.Opportunities, &stats.Impressions, &stats.Starts, &stats.Completes, &stats.Revenue, &stats.PublisherRevenue); err != nil {
 		return stats, err
 	}
-	if stats.Impressions > 0 {
-		stats.VCR = float64(stats.Completes) / float64(stats.Impressions) * 100
-	}
+	stats.VCR = videoCompletionRate(stats)
 	return stats, nil
 }
 
@@ -471,11 +469,12 @@ func overviewSummaryFromVideoStats(stats VideoStats) VideoOverviewSummary {
 		AdRequests:       stats.AdRequests,
 		Opportunities:    stats.Opportunities,
 		Impressions:      stats.Impressions,
+		Starts:           stats.Starts,
 		Completes:        stats.Completes,
 		Revenue:          stats.Revenue,
 		PublisherRevenue: stats.PublisherRevenue,
 		Margin:           stats.Revenue - stats.PublisherRevenue,
-		VCR:              stats.VCR,
+		VCR:              videoCompletionRate(stats),
 	}
 	if summary.Impressions > 0 {
 		summary.ECPM = summary.Revenue / float64(summary.Impressions) * 1000
@@ -531,6 +530,7 @@ func (s *clickHouseVideoMetricsStore) queryVideoStatsRange(ctx context.Context, 
 			countIf(event_type = 'request') AS ad_requests,
 			countIf(event_type = 'opportunity') AS opportunities,
 			countIf(event_type = 'impression') AS impressions,
+			countIf(event_type = 'start') AS starts,
 			countIf(event_type = 'complete') AS completes,
 			sumIf(revenue_usd, event_type = 'impression') AS revenue,
 			sumIf(publisher_revenue_usd, event_type = 'impression') AS publisher_revenue
@@ -538,12 +538,10 @@ func (s *clickHouseVideoMetricsStore) queryVideoStatsRange(ctx context.Context, 
 		WHERE event_time >= ? AND event_time < ?
 	`, s.table)
 	stats := VideoStats{}
-	if err := s.db.QueryRowContext(ctx, query, start.UTC(), end.UTC()).Scan(&stats.AdRequests, &stats.Opportunities, &stats.Impressions, &stats.Completes, &stats.Revenue, &stats.PublisherRevenue); err != nil {
+	if err := s.db.QueryRowContext(ctx, query, start.UTC(), end.UTC()).Scan(&stats.AdRequests, &stats.Opportunities, &stats.Impressions, &stats.Starts, &stats.Completes, &stats.Revenue, &stats.PublisherRevenue); err != nil {
 		return stats, err
 	}
-	if stats.Impressions > 0 {
-		stats.VCR = float64(stats.Completes) / float64(stats.Impressions) * 100
-	}
+	stats.VCR = videoCompletionRate(stats)
 	return stats, nil
 }
 

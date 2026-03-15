@@ -1,6 +1,14 @@
 package endpoints
 
-import "testing"
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/julienschmidt/httprouter"
+)
 
 func TestVideoExchangeSyncPipelineCfgPropagatesSourceAndCampaignFields(t *testing.T) {
 	handler := NewVideoExchangeHandler("")
@@ -203,5 +211,123 @@ func TestVideoExchangeSyncPipelineCfgPropagatesExtraDemandIdentity(t *testing.T)
 	}
 	if registered.ExtraDemand[0].FloorCPM != 3.0 {
 		t.Fatalf("expected extra floor 3.0, got %v", registered.ExtraDemand[0].FloorCPM)
+	}
+}
+
+func TestVideoExchangeGetRecoversMissingEntryFromRuntimeConfig(t *testing.T) {
+	handler := NewVideoExchangeHandler("")
+	handler.SetPipelineLookup(func(id string) *AdServerConfig {
+		if id != "5679c6f87c033624" {
+			return nil
+		}
+		return &AdServerConfig{
+			PlacementID:        id,
+			PublisherID:        "pub-1",
+			DomainOrApp:        "tv.example.com",
+			ContentURL:         "https://tv.example.com/live",
+			MinDuration:        15,
+			MaxDuration:        30,
+			AllowedBidders:     []string{"appnexus", "ix"},
+			FloorCPM:           2.1,
+			CampaignID:         "camp-1",
+			Active:             true,
+			TimeoutMS:          700,
+			VideoPlacementType: string(PlacementInStream),
+			ExtraDemand:        []ExtraDemandCfg{{CampaignID: "camp-2"}},
+		}
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/dashboard/video/5679c6f87c033624", nil)
+	handler.Get()(rec, req, httprouter.Params{{Key: "id", Value: "5679c6f87c033624"}})
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var entry VideoExchangeEntry
+	if err := json.NewDecoder(rec.Body).Decode(&entry); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if entry.ID != "5679c6f87c033624" {
+		t.Fatalf("expected recovered id, got %q", entry.ID)
+	}
+	if entry.Name != "5679c6f87c033624" {
+		t.Fatalf("expected recovered name to default to placement id, got %q", entry.Name)
+	}
+	if entry.CampaignID != "camp-1" {
+		t.Fatalf("expected campaign_id from runtime config, got %q", entry.CampaignID)
+	}
+	if len(entry.DemandLinks) != 2 || entry.DemandLinks[0] != "camp-1" || entry.DemandLinks[1] != "camp-2" {
+		t.Fatalf("expected demand links to include runtime campaign ids, got %#v", entry.DemandLinks)
+	}
+	if _, ok := handler.store.get("5679c6f87c033624"); !ok {
+		t.Fatal("expected missing runtime placement to be materialized into store")
+	}
+}
+
+func TestVideoExchangeDeleteFallsBackToRuntimeConfig(t *testing.T) {
+	handler := NewVideoExchangeHandler("")
+	handler.SetPipelineLookup(func(id string) *AdServerConfig {
+		if id == "placement-runtime-only" {
+			return &AdServerConfig{PlacementID: id}
+		}
+		return nil
+	})
+	var unregistered string
+	handler.SetPipelineUnregister(func(id string) {
+		unregistered = id
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/dashboard/video/placement-runtime-only", nil)
+	handler.Delete()(rec, req, httprouter.Params{{Key: "id", Value: "placement-runtime-only"}})
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if unregistered != "placement-runtime-only" {
+		t.Fatalf("expected runtime placement to be unregistered, got %q", unregistered)
+	}
+}
+
+func TestVideoExchangeUpdateRecoversMissingEntryFromRuntimeConfig(t *testing.T) {
+	handler := NewVideoExchangeHandler("")
+	handler.SetPipelineLookup(func(id string) *AdServerConfig {
+		if id != "placement-update" {
+			return nil
+		}
+		return &AdServerConfig{
+			PlacementID:        id,
+			PublisherID:        "pub-1",
+			DomainOrApp:        "tv.example.com",
+			ContentURL:         "https://tv.example.com/live",
+			MinDuration:        15,
+			MaxDuration:        30,
+			Active:             true,
+			VideoPlacementType: string(PlacementInStream),
+		}
+	})
+	var registered *AdServerConfig
+	handler.SetPipelineRegister(func(cfg *AdServerConfig) {
+		registered = cfg
+	})
+
+	body := strings.NewReader(`{"name":"Recovered Placement","environment":"ctv","placement":"instream","integration_type":"open_rtb","min_duration":15,"max_duration":30,"floor_cpm":1.5,"active":true}`)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPut, "/dashboard/video/placement-update", body)
+	handler.Update()(rec, req, httprouter.Params{{Key: "id", Value: "placement-update"}})
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	entry, ok := handler.store.get("placement-update")
+	if !ok {
+		t.Fatal("expected recovered entry to be present in store after update")
+	}
+	if entry.Name != "Recovered Placement" {
+		t.Fatalf("expected updated name, got %q", entry.Name)
+	}
+	if registered == nil || registered.PlacementID != "placement-update" {
+		t.Fatalf("expected updated placement to be synced back into runtime config, got %#v", registered)
 	}
 }

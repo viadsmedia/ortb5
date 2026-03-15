@@ -72,10 +72,10 @@ func TestOverviewSummaryFromVideoStats(t *testing.T) {
 		AdRequests:       1000,
 		Opportunities:    250,
 		Impressions:      125,
+		Starts:           110,
 		Completes:        100,
 		Revenue:          12.5,
 		PublisherRevenue: 8.0,
-		VCR:              80,
 	})
 	if summary.FillRate != 25 {
 		t.Fatalf("expected fill rate 25, got %v", summary.FillRate)
@@ -86,10 +86,20 @@ func TestOverviewSummaryFromVideoStats(t *testing.T) {
 	if summary.ECPM != 100 {
 		t.Fatalf("expected ecpm 100, got %v", summary.ECPM)
 	}
-	if summary.Viewability != 92 {
+	if summary.VCR != float64(100)/float64(110)*100 {
+		t.Fatalf("expected vcr %.6f, got %v", float64(100)/float64(110)*100, summary.VCR)
+	}
+	if summary.Viewability != 100 {
 		t.Fatalf("expected viewability 92, got %v", summary.Viewability)
 	}
 	if summary.Margin != 4.5 {
 		t.Fatalf("expected margin 4.5, got %v", summary.Margin)
+	}
+}
+
+func TestVideoCompletionRateFallsBackToImpressions(t *testing.T) {
+	stats := VideoStats{Impressions: 20, Completes: 10}
+	if got := videoCompletionRate(stats); got != 50 {
+		t.Fatalf("expected fallback vcr 50, got %v", got)
 	}
 }
