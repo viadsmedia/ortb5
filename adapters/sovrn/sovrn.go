@@ -132,20 +132,12 @@ func addHeaderIfNonEmpty(headers http.Header, headerName string, headerValue str
 }
 
 func (s *SovrnAdapter) MakeBids(request *openrtb2.BidRequest, bidderRequest *adapters.RequestData, bidderResponse *adapters.ResponseData) (*adapters.BidderResponse, []error) {
-	if bidderResponse.StatusCode == http.StatusNoContent {
+	if adapters.IsResponseStatusCodeNoContent(bidderResponse) {
 		return nil, nil
 	}
 
-	if bidderResponse.StatusCode == http.StatusBadRequest {
-		return nil, []error{&errortypes.BadInput{
-			Message: fmt.Sprintf("Unexpected status code: %d. Run with request.debug = 1 for more info", bidderResponse.StatusCode),
-		}}
-	}
-
-	if bidderResponse.StatusCode != http.StatusOK {
-		return nil, []error{&errortypes.BadServerResponse{
-			Message: fmt.Sprintf("Unexpected status code: %d. Run with request.debug = 1 for more info", bidderResponse.StatusCode),
-		}}
+	if err := adapters.CheckResponseStatusCodeForErrors(bidderResponse); err != nil {
+		return nil, []error{err}
 	}
 
 	var bidResponse openrtb2.BidResponse

@@ -2,7 +2,6 @@ package adgeneration
 
 import (
 	"errors"
-	"fmt"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -189,18 +188,12 @@ func (adg *AdgenerationAdapter) getCurrency(request *openrtb2.BidRequest) string
 }
 
 func (adg *AdgenerationAdapter) MakeBids(internalRequest *openrtb2.BidRequest, externalRequest *adapters.RequestData, response *adapters.ResponseData) (*adapters.BidderResponse, []error) {
-	if response.StatusCode == http.StatusNoContent {
+	if adapters.IsResponseStatusCodeNoContent(response) {
 		return nil, nil
 	}
-	if response.StatusCode == http.StatusBadRequest {
-		return nil, []error{&errortypes.BadInput{
-			Message: fmt.Sprintf("Unexpected status code: %d. Run with request.debug = 1 for more info", response.StatusCode),
-		}}
-	}
-	if response.StatusCode != http.StatusOK {
-		return nil, []error{&errortypes.BadServerResponse{
-			Message: fmt.Sprintf("Unexpected status code: %d. Run with request.debug = 1 for more info", response.StatusCode),
-		}}
+
+	if err := adapters.CheckResponseStatusCodeForErrors(response); err != nil {
+		return nil, []error{err}
 	}
 	var bidResp adgServerResponse
 	err := jsonutil.Unmarshal(response.Body, &bidResp)
